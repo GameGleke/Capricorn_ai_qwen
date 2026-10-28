@@ -22,3 +22,6 @@ sc_realm_cache
 # веса моделей Hugging Face (качаются в ~6 ГБ, в git не нужны)
 hf_models/
 hf_cache/
+
+# GGUF-веса llama.cpp (~5 ГБ, качаются один раз)
+gguf_models/

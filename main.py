@@ -42,6 +42,7 @@ try:
     from ai import AI
     from local_ai import LocalAI
     from hf_backend import HFBackend
+    from llama_backend import LlamaBackend
     from persona import LINES, gendered, line, set_user
     from avatar import Avatar
     import zapret
@@ -56,8 +57,10 @@ except ImportError as e:
 DEFAULTS = {
     "enable_ai": False,
     "local_ai": True,
-    "ai_backend": "ollama",  # "ollama" — модель через Ollama; "hf" — Qwen 9B прямо с Hugging Face
+    "ai_backend": "llama",  # "ollama" — модель через Ollama; "hf" — Qwen через transformers; "llama" — GGUF через llama.cpp (рекомендуется)
     "hf_model": "Qwen/Qwen3.5-9B",
+    "llama_repo": "unsloth/Qwen3.5-9B-GGUF",
+    "llama_file": "Qwen3.5-9B-Q4_K_M.gguf",
     "local_model": "qwen3:8b",
     "barge_in": True,
     "mic_device": None,
@@ -247,6 +250,16 @@ def fullscreen_app_active():
         return False
 
 
+def make_backend(cfg):
+    """Фабрика «разума» по настройке ai_backend: llama (GGUF, рекомендуется) / hf / ollama."""
+    backend = cfg.get("ai_backend", "llama")
+    if backend == "hf":
+        return HFBackend(cfg)
+    if backend == "llama":
+        return LlamaBackend(cfg)
+    return LocalAI(cfg)
+
+
 class Capri(QObject):
     summon = Signal()
     vanish = Signal()
@@ -261,13 +274,14 @@ class Capri(QObject):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self._backend_gen = 0  # защита от гонки: какое переключение разума считать свежим
         words = sorted(cfg["wake_words"], key=len, reverse=True)
         self.wake_re = re.compile(r"(^|\s)(" + "|".join(map(re.escape, words)) + r")(?=\s|$|[,.!?])",
                                   re.IGNORECASE)
         self.ai = AI(cfg)
         if cfg.get("local_ai"):
-            # "hf" — бесплатная Qwen 9B с Hugging Face (transformers), иначе — Ollama
-            self.local = HFBackend(cfg) if cfg.get("ai_backend") == "hf" else LocalAI(cfg)
+            # выбор разума: "llama" — GGUF через llama.cpp (рекомендуется), "hf" — transformers, иначе Ollama
+            self.local = make_backend(cfg)
         else:
             self.local = None
         if self.local:
@@ -296,7 +310,7 @@ class Capri(QObject):
     def start(self):
         threading.Thread(target=self._worker, daemon=True).start()
         if self.local:
-            threading.Thread(target=self.local.start_server, daemon=True).start()
+            threading.Thread(target=self._start_backend, daemon=True).start()
         model =os.path.join(BASE, self.cfg["vosk_model"])
         if os.path.isdir(model):
             self.listener = Listener(model, self.on_final, self.on_partial, self.on_listener_error,
@@ -469,6 +483,24 @@ class Capri(QObject):
         self.cfg["local_model"] = name
         save_setting("local_model", name)
 
+    def _start_backend(self):
+        """Поднимает разум в фоне; если за это время бэкенд снова переключили — результат не нужен.
+        Провал больше не молчаливый: причину Капри говорит вслух (см. capri.log / ai_diag.txt)."""
+        gen = self._backend_gen
+        backend = self.local
+        try:
+            backend.start_server()
+        except Exception as e:
+            log.exception("старт разума упал")
+            backend.error = str(e)[:200]
+        if gen != self._backend_gen or self.local is not backend:
+            return
+        if getattr(backend, "ready", False):
+            self.subtitle.emit("Мой разум на базе нейросети загружен и готов к разговорам.")
+        elif getattr(backend, "error", ""):
+            self.say("Моя нейросеть сейчас не работает: " + backend.error +
+                     " Пока что смогу только искать ответы в интернете.")
+
     # ----- config.json на лету -----
     @staticmethod
     def _config_mtime():
@@ -493,20 +525,26 @@ class Capri(QObject):
         for key in ("sites", "apps", "app_aliases", "search_when_unsure", "browser", "chatter", "replies",
                     "user_name_mode", "user_name", "user_gender"):
             self.cfg[key] = fresh[key]
-        # смена бэкенда разума (ollama <-> hf) или модели на лету — без перезапуска
+        # смена бэкенда разума (ollama <-> hf <-> llama) или модели на лету — без перезапуска
         backend = fresh.get("ai_backend", "ollama")
-        if self.cfg.get("ai_backend") != backend or (backend == "hf" and
-                                                    self.cfg.get("hf_model") != fresh.get("hf_model")):
+        if (self.cfg.get("ai_backend") != backend
+                or (backend == "hf" and self.cfg.get("hf_model") != fresh.get("hf_model"))
+                or (backend == "llama" and (self.cfg.get("llama_repo") != fresh.get("llama_repo")
+                                            or self.cfg.get("llama_file") != fresh.get("llama_file")))):
             self.cfg["ai_backend"] = backend
             self.cfg["hf_model"] = fresh.get("hf_model")
+            self.cfg["llama_repo"] = fresh.get("llama_repo")
+            self.cfg["llama_file"] = fresh.get("llama_file")
             if hasattr(self.local, "shutdown"):
                 self.local.shutdown()  # снимаем старый воркер перед переключением
             if fresh.get("local_ai"):
-                self.local = HFBackend(fresh) if backend == "hf" else LocalAI(fresh)
+                self.local = make_backend(fresh)
                 self.local.on_model_change = self._remember_model
                 self.actions.local = self.local
-                threading.Thread(target=self.local.start_server, daemon=True).start()
-                log.info("Разум переключён на %s", "Hugging Face Qwen" if backend == "hf" else "Ollama")
+                self._backend_gen += 1
+                threading.Thread(target=self._start_backend, daemon=True).start()
+                log.info("Разум переключён на %s", {"hf": "Hugging Face Qwen (transformers)",
+                                                    "llama": "Qwen GGUF (llama.cpp)"}.get(backend, "Ollama"))
             else:
                 self.local = None
                 self.actions.local = None

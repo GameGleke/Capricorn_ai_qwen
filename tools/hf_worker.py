@@ -15,6 +15,10 @@ import re
 import sys
 
 
+def err(text):
+    print("ERROR: " + str(text)[:300], file=sys.stderr, flush=True)
+
+
 def send(obj):
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     sys.stdout.flush()
@@ -130,6 +134,7 @@ def main():
             else:
                 send({"id": rid, "error": f"неизвестная команда {cmd}"})
         except Exception as e:
+            err(e)
             send({"id": rid, "error": str(e)[:400]})
 
 

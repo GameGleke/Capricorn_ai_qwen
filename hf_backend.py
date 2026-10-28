@@ -53,6 +53,7 @@ class HFBackend:
         self._proc = None
         self._lock = threading.Lock()
         self._id = 0
+        self.error = ""
         self.on_model_change = None
 
     # ----- процесс-воркер -----
@@ -61,13 +62,26 @@ class HFBackend:
         exe = sys.executable
         worker = os.path.join(BASE, "tools", "hf_worker.py")
         self._proc = subprocess.Popen([exe, worker, self.model], stdin=subprocess.PIPE,
-                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       text=True, encoding="utf-8", bufsize=1,
                                       creationflags=NO_WINDOW if os.name == "nt" else 0,
                                       env=_env())
-        thread = threading.Thread(target=self._pump_stdout, daemon=True)
-        thread.start()
         self._out = queue.Queue()
+        threading.Thread(target=self._pump_stdout, daemon=True).start()
+        threading.Thread(target=self._pump_stderr, daemon=True).start()
+
+    def _pump_stderr(self):
+        """Ошибки загрузки модели раньше уходили в DEVNULL — Капри молча «загугливала». Теперь в лог."""
+        try:
+            for line in self._proc.stderr:
+                line = line.rstrip()
+                if not line:
+                    continue
+                log.info("HF-воркер: %s", line[:300])
+                if line.startswith("ERROR:"):
+                    self.error = line[6:].strip()
+        except Exception:
+            pass
 
     def _pump_stdout(self):
         """Читает JSON-строки воркера в очередь — отдельно от потоков запросов, чтобы
@@ -131,7 +145,8 @@ class HFBackend:
         try:
             import transformers  # noqa: F401
         except ImportError:
-            log.info("Нет transformers — установи: pip install transformers accelerate")
+            self.error = "transformers не установлен — запусти setup_hf.bat"
+            log.info(self.error)
             return
         self._spawn()
         msg = self._request({"cmd": "load"}, LOAD_TIMEOUT)
@@ -139,9 +154,10 @@ class HFBackend:
             self.ready = True
             log.info("Модель %s с Hugging Face загружена", self.model)
         else:
+            reason = self.error or "проверь интернет (первое скачивание весов долгое) и память (safetensors 9B нужно ~18+ ГБ)"
             self.shutdown()
-            log.info("Не удалось загрузить %s — проверь интернет (первое скачивание ~6 ГБ) "
-                     "и память (нужно ~7–8 ГБ)", self.model)
+            self.error = reason
+            log.info("Не удалось загрузить %s: %s", self.model, reason)
 
     def shutdown(self):
         proc, self._proc = self._proc, None

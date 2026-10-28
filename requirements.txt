@@ -19,3 +19,8 @@ winrt-Windows.Foundation.Collections>=2.0
 # --- опционально: разум с Hugging Face (Qwen 3.5 9B без Ollama) — ставит setup_hf.bat ---
 # transformers>=4.51
 # accelerate
+
+# --- опционально: разум через llama.cpp (GGUF Qwen 3.5 9B без Ollama и без torch) — ставит setup_llama.bat ---
+# ставится отдельной командой (компилируется при установке), в общем списке не обязательна:
+# llama-cpp-python
+# huggingface_hub

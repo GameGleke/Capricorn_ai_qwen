@@ -76,18 +76,58 @@ def main():
         say(f"[!] весов {model_id} нигде нет — при запуске Капри будет качать ~6 ГБ молча, "
             "в фоне. Проще докачать заранее: python tools/install_hf.py")
 
-    # 4) Ollama (если выбран её бэкенд)
-    if backend != "hf":
+    # 4) llama.cpp (GGUF-бэкенд) — проверяем библиотеку и скачанный .gguf
+    if backend == "llama":
+        try:
+            import llama_cpp
+            say(f"[OK] llama-cpp-python {getattr(llama_cpp, '__version__', '?')} установлена")
+        except ImportError:
+            say("[!] llama-cpp-python НЕ установлена — запусти setup_llama.bat.")
+        repo = cfg.get("llama_repo", "unsloth/Qwen3.5-9B-GGUF")
+        fname = cfg.get("llama_file", "Qwen3.5-9B-Q4_K_M.gguf")
+        gguf_dir = os.path.join(BASE, "gguf_models")
+        found = None
+        for cand in (os.path.join(gguf_dir, fname),):
+            if os.path.isfile(cand):
+                found = cand
+        if not found and os.path.isdir(gguf_dir):
+            for d in os.listdir(gguf_dir):
+                p = os.path.join(gguf_dir, d, fname)
+                if os.path.isfile(p):
+                    found = p
+        if found:
+            say(f"[OK] веса GGUF на месте: {found} ({os.path.getsize(found)//2**20} МБ)")
+        else:
+            say(f"[!] файла {fname} из {repo} нет в gguf_models\\ — первый запуск Капри будет качать его ~5 ГБ; "
+                "проще докачать заранее: python tools/install_llama.py")
+
+    # 5) Ollama (если выбран её бэкенд)
+    if backend not in ("hf", "llama"):
         try:
             import urllib.request
             with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=2) as r:
                 names = [m["name"] for m in json.loads(r.read().decode()).get("models", [])]
             say(f"[OK] Ollama отвечает, модели: {names or 'НИ ОДНОЙ — запусти setup_ai.bat'}")
         except Exception:
-            say("[!] Ollama не отвечает на 127.0.0.1:11434 — установи/запусти её или перейди на hf.")
+            say("[!] Ollama не отвечает на 127.0.0.1:11434 — установи/запусти её или перейди на llama/hf.")
 
-    # 5) живой тест: задать вопрос тому бэкенду, который выберет Капри
-    if backend == "hf" and hf_ok:
+    # 6) живой тест: задать вопрос тому бэкенду, который выберет Капри
+    if backend == "llama":
+        from llama_backend import LlamaBackend
+        say("\nТестирую llama.cpp-бэкенд (первый запуск может качать weights долго)...")
+        be = LlamaBackend(cfg)
+        be.start_server()
+        if not be.ready:
+            say(f"[ОШИБКА] модель не загрузилась — именно поэтому Капри шлёт всё в поиск.")
+            say(f"         Причина: {be.error or 'неизвестна, смотри capri.log'}")
+            say("         Частые причины: нет интернета на время скачивания ~5 ГБ, не хватает памяти,")
+            say("         huggingface.co перекрыт провайдером (поможет VPN или HF_ENDPOINT=https://hf-mirror.com).")
+        else:
+            for q in ("Почему небо голубое?", "Расскажи стишок про котов"):
+                a = be.ask(q)
+                say(f"Вопрос: {q}\nОтвет: {a if a else '[пусто -> Капри откроет поиск]'}")
+        be.shutdown()
+    elif backend == "hf" and hf_ok:
         from hf_backend import HFBackend
         say("\nТестирую HF-бэкенд (первый запуск может качать weights долго)...")
         be = HFBackend(cfg)
@@ -101,7 +141,7 @@ def main():
                 a = be.ask(q)
                 say(f"Вопрос: {q}\nОтвет: {a if a else '[пусто -> Капри откроет поиск]'}")
         be.shutdown()
-    elif backend != "hf":
+    elif backend not in ("hf", "llama"):
         from local_ai import LocalAI
         say("\nТестирую Ollama-бэкенд...")
         la = LocalAI(cfg)
