@@ -221,6 +221,19 @@ class LocalAI:
             return self._chat(messages + [{"role": "system", "content": NO_THINKING}], max_tokens)
         return text
 
+    def generate(self, messages, max_tokens=300):
+        """Сырой вызов модели списком сообщений — нужно веб-ответам (websearch.answer_with_web)."""
+        try:
+            resp = _post("/api/chat", {
+                "model": self.model, "messages": messages, "stream": False, "think": False,
+                "keep_alive": "10m",
+                "options": {"num_predict": max_tokens, "temperature": 0.4},
+            }, 120)
+            return strip_reasoning(resp.get("message", {}).get("content", ""))
+        except Exception as e:
+            log.info("Ollama generate не удалась: %s", e)
+            return ""
+
     def ask(self, question):
         """Текст ответа или None, если лучше открыть поиск."""
         if FRESH.search(question.lower()):

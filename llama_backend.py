@@ -193,6 +193,10 @@ class LlamaBackend:
             text = text[:-len("[truncated]")].rstrip()
         return text
 
+    def generate(self, messages, max_tokens=300):
+        """Сырой вызов модели — нужен веб-ответам (websearch.answer_with_web)."""
+        return self._chat(messages, max_tokens)
+
     def ask(self, question):
         """Текст ответа или None, если лучше открыть поиск (свежие факты / модель не справилась)."""
         if FRESH.search(question.lower()):

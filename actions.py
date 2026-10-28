@@ -18,7 +18,9 @@ from dataclasses import dataclass
 import psutil
 
 import automation
+import fileops
 import media
+import websearch
 from persona import line
 
 log = logging.getLogger("capri")
@@ -934,6 +936,26 @@ REPLY_RE = (r"^((когда|если) (я )?(говорю|скажу|произ�
 FORGET_REPLY_RE = r"^(забудь|удали|убери) (свой |мой |этот )?ответ (на|для) (фразу |слова |вопрос )?(?P<p>.+)$"
 
 
+# --- распознавание файловых команд (порядок важен: delete раньше move/copy, всё раньше «открой X») ---
+PLACE_RX = r"(?P<place>на рабоч\w+ стол\w*|в (мои )?документ\w*|на (мой |мои )?диск\w* [a-zа-я]|в папк\w* (?P<pname>[^,]+?)|" \
+           r"в (загрузк\w*|скачанн\w*|фото\w*|изображени\w*|картинк\w*|музык\w*|видео\w*))?"
+FILE_WRITE_RE = re.compile(rf"^(запиши|записать|добавь|добавить|впиши|сохрани|сохранить)( мне)?{PLACE_RX}?" \
+                           r"( в)? ?(текстов\w+ )?(файл\w*|документ\w*|заметк\w*|txt)\s*(?P<q>.*)$")
+FILE_READ_RE = re.compile(r"^(прочитай|прочесть|озвучь|озвучить|перескажи|что в файле|покажи содержимое)" \
+                          r"( мне)?( файл\w*| документа\w*)?\s+(?P<q>.+)$")
+FILE_MOVE_RE = re.compile(rf"^(передвинь|перенеси|перетащи|перемести)(\w*|ть)( мой| мою)?(?P<what>[^,]*?)" \
+                          rf"( в| на){PLACE_RX}$")
+FILE_COPY_RE = re.compile(rf"^(скопируй|копируй|сделать копию|сделай копию)( мой| мою)?(?P<what>[^,]*?)" \
+                          rf"( в| на){PLACE_RX}$")
+FILE_DELETE_RE = re.compile(r"^(удали|удалить|выкинь|выбрось|сотри|разруши|прибей файл|убей файл)( мой| мою)? " \
+                            r"(файл\w*|папк\w*|документ\w*|картинк\w*|фото\w*)?\s*(?P<q>.+)$")
+FILE_LIST_RE = re.compile(rf"^(что у меня|что в|покажи|чем я владею|перечисли)( все)?( файлы| содержимое)?{PLACE_RX}" \
+                          r"$|^(открой|покажи) (мне )?(проводник|папку)( {PLACE_RX})?$")
+FILE_CREATE_RE = re.compile(rf"^(создай|сделай|создать|заведи)( мне)? (новую |новый |новая )?" \
+                            rf"(?P<kind>папк\w*|файл\w*|текстов\w+ файл\w*|документ\w*|таблиц\w*|заметк\w*)" \
+                            rf"( с именем| по имени| названием| именуемый)?(?P<name>.*){PLACE_RX}$")
+
+
 class Actions:
     def __init__(self, cfg, base_dir, ai, save=None):
         self.cfg = cfg
@@ -1016,6 +1038,14 @@ class Actions:
             (r"\bсверни\b", self.minimize),
             (r"(закрой|закрыть|убери) (эту |текущую |\S+ )?вкладк", self.tab),
             (r"нов(ую|ая) вкладк|\b(верни|восстанови) (закрыт\w* )?вкладк|(следующ|предыдущ)\w* вкладк", self.tab),
+            # --- файлы: запись, чтение, перемещение, копирование, удаление (с подтверждением) ---
+            (FILE_WRITE_RE, self.file_write),
+            (FILE_READ_RE, self.file_read),
+            (FILE_MOVE_RE, self.file_move),
+            (FILE_COPY_RE, self.file_copy),
+            (FILE_DELETE_RE, self.file_delete),
+            (FILE_LIST_RE, self.file_list),
+            (FILE_CREATE_RE, self.file_create),
             (r"^(создай|сделай|создать) (?P<what>.*(папк|файл|документ|таблиц).*)$", self.create),
             (r"^(найди|покажи|открой|загугли|погугли|поищи)( мне)?( в интернете| в гугле)? (фото\w*|фотк\w*|"
              r"картинк\w*|изображени\w*|пикч\w*|обои)( (с|со|про|о|об|на тему))? (?P<q>.+)$", self.images),
@@ -1235,15 +1265,208 @@ class Actions:
         err = self.remember("replies", close, None)
         return Reply(line("remember_fail", e=err) if err else line("forget_ok", t=close))
 
+    # --- файлы: создать/записать/прочитать/переместить/скопировать/удалить ---
+    def _place_from(self, m):
+        """Куда: из группы place регулярника. None → дефолт (Рабочий стол)."""
+        place = (m.groupdict().get("place") or "").strip()
+        if not place:
+            return fileops.resolve_place("на рабочем столе", self.base_dir), "на рабочем столе"
+        got = fileops.resolve_place(place, self.base_dir)
+        return got, place
+
+    def _find_target(self, name):
+        """Найти файл/папку по названию: сначала в проекте и популярных папках, потом поиск."""
+        name = name.strip().strip('.,!"«»')
+        if not name:
+            return None
+        low = norm(name)
+        for cand in (name, low + ".txt"):
+            p = os.path.join(self.base_dir, cand)
+            if os.path.exists(p):
+                return p
+        spot = find_folder(name, search=True)
+        if spot:
+            return spot[0]
+        return fileops.find_file(low)
+
+    def file_create(self, c, m):
+        kind = m.group("kind")
+        name = (m.group("name") or "").strip().strip('.,!"«»')
+        place, place_name = self._place_from(m)
+        if not place:
+            return Reply(line("folder_missing", t=(m.groupdict().get("pname") or place_name)))
+        ext = ""
+        dot = re.search(r"\s*(точка|dot|\.)\s*(?P<e>[a-zа-я0-9]+)$", name)
+        if dot:
+            ext, name = "." + translit(dot.group("e")), name[:dot.start()].strip()
+        if kind.startswith("папк"):
+            default, is_dir = "Новая папка", True
+        elif kind.startswith("таблиц"):
+            default, ext, is_dir = "Новая таблица", ext or ".xlsx", False
+        elif kind.startswith("заметк"):
+            default, ext, is_dir = "Заметка", ext or ".txt", False
+        elif kind.startswith("документ") and not kind.startswith("текст"):
+            default, ext, is_dir = "Новый документ", ext or ".docx", False
+        else:
+            default, ext, is_dir = "Новый файл", ext or ".txt", False
+        name = re.sub(r'[<>:"/\\|?*]', "", name).strip() or default
+        name = name[:1].upper() + name[1:]
+        path = fileops.unique_path(os.path.join(place, name + ("" if is_dir else ext)))
+        try:
+            if is_dir:
+                os.makedirs(path, exist_ok=True)
+            else:
+                open(path, "x", encoding="utf-8").close()
+        except OSError as e:
+            return Reply(line("file_fail", e=e))
+        return Reply(line("file_created", t=os.path.basename(path), where=place_name))
+
+    def file_write(self, c, m):
+        """«запиши в файл заметки купил молока» — дописывает строку в txt-файл (создаёт при нужде)."""
+        q = (m.group("q") or "").strip()
+        if not q:
+            return Reply(line("file_need_text"))
+        fm = re.match(r"^((файл|документ|заметк)\w*\s+)?(?P<f>.+?)\s+(что|про|о|об|:)?\s*(?P<t>.*)$", q)
+        fname, text = (fm.group("f"), fm.group("t") or "") if fm else ("", q)
+        text = text or q
+        place, place_name = self._place_from(m)
+        if not place:
+            return Reply(line("folder_missing", t=place_name))
+        fname = re.sub(r"[<>:\"/\\|?*]", "", fname).strip()
+        if not fname:
+            fname = "заметки"
+        if not os.path.splitext(fname)[1]:
+            fname += ".txt"
+        path = os.path.join(place, fname)
+        exists = os.path.exists(path)
+        if exists and not fileops.allowed_path(path):
+            return Reply(line("file_forbidden", t=fname))
+
+        def do():
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    if exists and os.path.getsize(path):  # перенос только если в файле уже есть текст
+                        f.write("\n")
+                    f.write(text[:fileops.MAX_WRITE])
+                return Reply(line("file_written", t=fname, where=place_name))
+            except OSError as e:
+                return Reply(line("file_fail", e=e))
+        return do()
+
+    def file_read(self, c, m):
+        q = m.group("q").strip().strip('.,!"«»')
+        q = re.sub(r"^(файл|документ|текст)\w*\s+", "", q)
+        path = self._find_target(q)
+        if not path or os.path.isdir(path):
+            return Reply(line("file_missing", t=q))
+        try:
+            text = fileops.read_file(path)
+        except (OSError, UnicodeError) as e:
+            return Reply(line("file_fail", e=e))
+        if not text.strip():
+            return Reply(line("file_empty", t=os.path.basename(path)))
+        brief = re.sub(r"\s+", " ", text).strip()
+        return Reply(line("file_read", t=os.path.basename(path), body=brief[:600]))
+
+    def file_move(self, c, m):
+        what, place, place_name = m.group("what"), None, None
+        place, place_name = self._place_from(m)
+        if not place:
+            return Reply(line("folder_missing", t=(m.groupdict().get("pname") or place_name)))
+        src = self._find_target(what)
+        if not src:
+            return Reply(line("file_missing", t=what))
+        if not fileops.allowed_path(src) or not fileops.allowed_path(place):
+            return Reply(line("file_forbidden", t=what))
+
+        def do():
+            try:
+                dst = fileops.move_item(src, place)
+                return Reply(line("file_moved", t=os.path.basename(src), where=place_name))
+            except (OSError, shutil.Error) as e:
+                return Reply(line("file_fail", e=e))
+        return do()
+
+    def file_copy(self, c, m):
+        what = m.group("what")
+        place, place_name = self._place_from(m)
+        if not place:
+            return Reply(line("folder_missing", t=(m.groupdict().get("pname") or place_name)))
+        src = self._find_target(what)
+        if not src:
+            return Reply(line("file_missing", t=what))
+        if not fileops.allowed_path(src) or not fileops.allowed_path(place):
+            return Reply(line("file_forbidden", t=what))
+        try:
+            dst = fileops.copy_item(src, place)
+            return Reply(line("file_copied", t=os.path.basename(src), where=place_name))
+        except (OSError, shutil.Error) as e:
+            return Reply(line("file_fail", e=e))
+
+    def file_delete(self, c, m):
+        """Удаление — ТОЛЬКО после подтверждения «да». Файлы уходят в корзину, если возможно."""
+        q = (m.group("q") or "").strip().strip('.,!"«»')
+        q = re.sub(r"^(файл|папк|документ|картинк|фото)\w*\s+", "", q)
+        path = self._find_target(q)
+        if not path:
+            return Reply(line("file_missing", t=q))
+        if not fileops.allowed_path(path):
+            return Reply(line("file_forbidden", t=q))
+        name = os.path.basename(path)
+        kind = "папку" if os.path.isdir(path) else "файл"
+
+        def do():
+            try:
+                where = fileops.delete_item(path)
+                return Reply(line("file_deleted", t=name, where=where))
+            except PermissionError:
+                return Reply(line("file_forbidden", t=name))
+            except OSError as e:
+                return Reply(line("file_fail", e=e))
+        self.pending = do
+        return Reply(line("file_delete_ask", kind=kind, t=name))
+
+    def file_list(self, c, m):
+        place, place_name = self._place_from(m)
+        if not place:
+            return Reply(line("folder_missing", t=(m.groupdict().get("pname") or place_name)))
+        if re.search(r"проводник", c):
+            subprocess.Popen(["explorer", place])
+            return Reply(line("file_opened_folder", where=place_name))
+        try:
+            entries = sorted(os.listdir(place), key=str.lower)[:12]
+        except OSError as e:
+            return Reply(line("file_fail", e=e))
+        if not entries:
+            return Reply(line("file_folder_empty", where=place_name))
+        listed = ", ".join(e.removesuffix(".exe") for e in entries)
+        more = " и ещё…" if len(os.listdir(place)) > len(entries) else ""
+        return Reply(line("file_listing", where=place_name, items=listed + more))
+
     def fallback(self, cmd, force_search=False):
-        """Без ИИ: вопрос ищем в Google (если search_when_unsure не выключен), остальное — «не знаю команды»."""
+        """Без ИИ: вопрос ищем в интернете и отвечаем по найденному; остальное — «не знаю команды».
+
+        Раньше здесь открывался только Google с фразой «попросите загуглить» — теперь Капри
+        сама делает запрос (websearch), читает выдачу и пересказывает ответ голосом.
+        """
         c = norm(cmd)
-        if force_search or re.match(r"^(что|кто|как|какой|какая|какое|какие|почему|зачем|сколько|где|когда|куда|"
-                     r"откуда|чем|чей|расскажи|объясни|скажи)\b", c):
-            if not self.cfg.get("search_when_unsure", True):
-                return Reply(line("dont_know"))
+        wants_answer = force_search or re.match(r"^(что|кто|как|какой|какая|какое|какие|почему|зачем|сколько|где|когда|куда|"
+                     r"откуда|чем|чей|расскажи|объясни|скажи)\b", c) or websearch.is_fresh(c)
+        if wants_answer and self.cfg.get("search_when_unsure", True):
+            rows = websearch.web_search(cmd)
+            if rows:
+                model = getattr(self, "local", None)
+                text = websearch.answer_with_web(
+                    cmd, model.generate if model else (lambda msgs, **kw: ""), rows=rows)
+                if not text:  # модель молчит — озвучиваем лучший сниппет как есть
+                    top = rows[0]
+                    text = f"{top['title']}. {top['snippet']}".strip(". ")
+                self.web("https://www.google.com/search?q=" + urllib.parse.quote(cmd))
+                return Reply(line("web_answer", t=text))
             self.web("https://www.google.com/search?q=" + urllib.parse.quote(cmd))
             return Reply(line("search_q"))
+        if wants_answer:
+            return Reply(line("dont_know"))
         return Reply(line("unknown"))
 
     # --- команды ---
