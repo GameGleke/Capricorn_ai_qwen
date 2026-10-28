@@ -115,70 +115,114 @@ def _disk_free_gb(path):
         return 999.0
 
 
+def nvidia_cuda_major():
+    """Версия CUDA, которую поддерживает драйвер (старше или равна cu118 — вернёт None)."""
+    nvsmi = shutil.which("nvidia-smi")
+    if not nvsmi:
+        return None
+    try:
+        out = subprocess.run([nvsmi], capture_output=True, text=True, timeout=10).stdout
+        import re as _re
+        m = _re.search(r"CUDA Version:\s*(\d+)\.", out)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
 def install_prebuilt():
-    """Ставим готовый CUDA-wheel llama-cpp-python со страницы релизов — компилятор не нужен."""
-    ver = "0.3.36"
-    tag = "v%s-cu125" % ver
-    api = "https://api.github.com/repos/abetlen/llama-cpp-python/releases/tags/" + tag
-    url = ""
-    try:
-        req = urllib.request.Request(api, headers={"User-Agent": "capri-setup"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            data = json.load(r)
-        for a in data.get("assets", []):
-            name = a.get("name", "")
-            if name.endswith("win_amd64.whl") and a.get("browser_download_url"):
-                url = a["browser_download_url"]
-                size = int(a.get("size", 0)) // 2**20
-                break
-    except Exception as e:
-        say("[!] Не смог список релизов GitHub: %s" % e)
-    if not url:
-        # запасной вариант — известное имя файла этого релиза
-        url = ("https://github.com/abetlen/llama-cpp-python/releases/download/"
-               "%s/llama_cpp_python-%s-py3-none-win_amd64.whl" % (tag, ver))
-    whl = os.path.join(BASE, "_llama_cuda.whl")
-    if _disk_free_gb(os.environ.get("LOCALAPPDATA", BASE)) < 4:
-        say("[!] Мало места на диске для CUDA-сборки (<4 ГБ) — пропуск, ставим CPU-вариант.")
-        return False
-    say("[Capri] Качаю готовую CUDA-сборку llama.cpp (~500 МБ, один раз)...")
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "capri-setup"})
-        with urllib.request.urlopen(req, timeout=60) as r, open(whl + ".part", "wb") as out:
-            total = int(r.headers.get("Content-Length") or 0)
-            done = 0
-            while True:
-                chunk = r.read(2**20)
-                if not chunk:
-                    break
-                out.write(chunk)
-                done += len(chunk)
-                if total:
-                    print("\r[Capri]   %3.0f%% (%.1f/%.1f МБ)" %
-                          (done * 100 / total, done / 2**20, total / 2**20), flush=True)
-        os.replace(whl + ".part", whl)
-        say("")
-    except Exception as e:
-        say("[!] Готовый wheel не скачался: %s" % e)
+    """Ставим готовый CUDA-wheel llama-cpp-python со страницы релизов — компилятор не нужен.
+
+    Важно: в релизных win-колесах тег cuXXX означает версию сборки, а pip видит обычный
+    py3-none-win_amd64 и НЕ проверяет CUDA сам. Если у пользователя драйвер старее
+    (например CUDA 11), колесо cu125 поставится, но не импортируется. Поэтому перебираем
+    варианты от новой CUDA к старой и после каждой попытки проверяем реальный импорт.
+    """
+    drv = nvidia_cuda_major()
+    order = ["cu132", "cu130", "cu125", "cu124", "cu123", "cu122", "cu121", "cu118"]
+    if drv is not None:  # берём только теги не новее поддержки драйвера
+        fit = [t for t in order if int(t[2:]) <= drv]
+        if not fit:
+            say("[!] Драйвер поддерживает только CUDA %s — готовые wheels llama.cpp (cu118+) не подойдут." % drv)
+            return False
+        order = fit
+    tried = set()
+    for cuda in order:
+        for ver in ("0.3.36", "0.3.35", "0.3.34"):
+            key = (ver, cuda)
+            if key in tried:
+                continue
+            tried.add(key)
+            tag = "v%s-%s" % (ver, cuda)
+            fname = "llama_cpp_python-%s-py3-none-win_amd64.whl" % ver
+            url = "https://github.com/abetlen/llama-cpp-python/releases/download/%s/%s" % (tag, fname)
+            ok = _try_wheel(url, tag)
+            if ok:
+                return True
+    say("[!] Ни одна готовая CUDA-сборка не подошла (см. сообщения выше).")
+    return False
+
+
+def _try_wheel(url, tag):
+    # pip требует корректного имени файла wheel — сохраняем под именем из URL
+    fname = url.split("/")[-1].split("?")[0] or "llama_cuda.whl"
+    whl = os.path.join(BASE, fname)
+    if os.path.isfile(whl) and open(whl, "rb").read(2) == b"PK":
+        say("[Capri] Wheel %s уже скачен — пропускаю качание." % fname)
+    else:
+        if _disk_free_gb(os.environ.get("LOCALAPPDATA", BASE)) < 4:
+            say("[!] Мало места на диске для CUDA-сборки (<4 ГБ) — пропуск, ставим CPU-вариант.")
+            return False
+        say("[Capri] Качаю готовую сборку llama.cpp %s (~500 МБ, один раз)..." % tag)
         try:
-            os.remove(whl + ".part")
+            req = urllib.request.Request(url, headers={"User-Agent": "capri-setup"})
+            with urllib.request.urlopen(req, timeout=60) as r, open(whl + ".part", "wb") as out:
+                total = int(r.headers.get("Content-Length") or 0)
+                done = 0
+                while True:
+                    chunk = r.read(2**20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        print("\r[Capri]   %3.0f%% (%.1f/%.1f МБ)" %
+                              (done * 100 / total, done / 2**20, total / 2**20), flush=True)
+            head = open(whl + ".part", "rb").read(2)
+            if head != b"PK":
+                raise RuntimeError("скачанный файл не является zip/wheel (начинается с %r) — вероятно, GitHub вернул HTML-страницу" % head)
+            os.replace(whl + ".part", whl)
+            say("")
+        except Exception as e:
+            say("[!] Готовый wheel не скачался: %s" % e)
+            try:
+                os.remove(whl + ".part")
+            except OSError:
+                pass
+            return False
+    ok = run([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", whl])
+    if not ok:
+        try:
+            os.remove(whl)
         except OSError:
             pass
-        return False
-    ok = run([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", whl])
-    try:
-        os.remove(whl)
-    except OSError:
-        pass
-    if not ok:
         return False
     r = subprocess.run([sys.executable, "-c",
                         "import llama_cpp; from llama_cpp import Llama; print('[OK] импорт llama_cpp выполнен')"],
                        capture_output=True, text=True)
     if r.returncode == 0:
-        say("[OK] Установлена CUDA-версия llama-cpp-python — модель будет считать на видеокарте.")
+        say("[OK] Установлена CUDA-версия llama-cpp-python (%s) — модель будет считать на видеокарте." % tag)
+        try:
+            os.remove(whl)
+        except OSError:
+            pass
         return True
-    say("[!] CUDA-wheel поставился, но не импортируется: " + (r.stderr or "").strip()[:300])
+    err = (r.stderr or "").strip()
+    say("[!] Сборка %s поставилась, но не запускается Python-модуль: %s" % (tag, err[:300]))
+    if "DLL" in err or "dll" in err:
+        say("    Обычно это значит: версия CUDA сборки новее, чем поддерживает твой драйвер NVIDIA.")
+        say("    Пробую сборку со старой CUDA...")
     return False
 
 
