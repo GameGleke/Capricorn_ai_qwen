@@ -28,6 +28,31 @@ def _device(torch):
     return {}  # CPU: медленнее, но работает; веса остаются в RAM (~18 ГБ bf16)
 
 
+def _tf_version():
+    import transformers
+    parts = transformers.__version__.split(".")
+    return tuple(int(x) for x in parts[:2] if x.isdigit())
+
+
+def _arch_supported(src):
+    """Сверка architectures из config.json модели с классами установленного transformers.
+    Без этой проверки Капри молча уходила в поиск: у новой модели неизвестную архитектру
+    AutoModel не поднимает, а воркер умирал без объяснений."""
+    try:
+        cfg_path = os.path.join(src, "config.json") if os.path.isdir(src) else \
+            __import__("huggingface_hub").hf_hub_download(src, "config.json")
+        with open(cfg_path, encoding="utf-8") as f:
+            archs = json.load(f).get("architectures", [])
+    except Exception:
+        return None  # не удалось проверить — считаем, что поддерживается
+    try:
+        import transformers
+        known = set(dir(transformers))
+        return all(a in known for a in archs) if archs else None
+    except Exception:
+        return None
+
+
 def load_model(model_id):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -36,11 +61,20 @@ def load_model(model_id):
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     local = os.path.join(root, "hf_models", model_id.replace("/", "--"))
     src = local if os.path.isfile(os.path.join(local, "config.json")) else model_id
+    tfv = ".".join(map(str, _tf_version()))
+    if _arch_supported(src) is False:
+        raise RuntimeError(f"transformers {tfv} не знает модель {model_id} — обнови: "
+                           'python -m pip install -U "transformers>=4.57"')
     tok = AutoTokenizer.from_pretrained(src)
-    try:  # новый transformers переименовал torch_dtype в dtype
-        model = AutoModelForCausalLM.from_pretrained(src, dtype=torch.bfloat16, **_device(torch))
-    except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(src, torch_dtype=torch.bfloat16, **_device(torch))
+    kwargs = {"dtype": torch.bfloat16} if _tf_version() >= (4, 56) else {"torch_dtype": torch.bfloat16}
+    try:
+        model = AutoModelForCausalLM.from_pretrained(src, **kwargs, **_device(torch))
+    except Exception as e:
+        msg = str(e)
+        if "no matching model type" in msg or "does not recognize" in msg or "architecture" in msg.lower():
+            raise RuntimeError(f"transformers {tfv} не поддерживает {model_id}: обновись до версии >= 4.57 "
+                               '(python -m pip install -U "transformers>=4.57")') from e
+        raise
     model.eval()
     return tok, model
 
