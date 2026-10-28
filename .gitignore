@@ -18,3 +18,7 @@ __pycache__/
 sclauncher.log
 sc_country_cache
 sc_realm_cache
+
+# веса моделей Hugging Face (качаются в ~6 ГБ, в git не нужны)
+hf_models/
+hf_cache/

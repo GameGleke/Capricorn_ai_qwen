@@ -41,6 +41,7 @@ try:
     from actions import CAPRI_URL, Actions, Reply
     from ai import AI
     from local_ai import LocalAI
+    from hf_backend import HFBackend
     from persona import LINES, gendered, line, set_user
     from avatar import Avatar
     import zapret
@@ -55,6 +56,8 @@ except ImportError as e:
 DEFAULTS = {
     "enable_ai": False,
     "local_ai": True,
+    "ai_backend": "ollama",  # "ollama" — модель через Ollama; "hf" — Qwen 9B прямо с Hugging Face
+    "hf_model": "Qwen/Qwen3.5-9B",
     "local_model": "qwen3:8b",
     "barge_in": True,
     "mic_device": None,
@@ -262,7 +265,11 @@ class Capri(QObject):
         self.wake_re = re.compile(r"(^|\s)(" + "|".join(map(re.escape, words)) + r")(?=\s|$|[,.!?])",
                                   re.IGNORECASE)
         self.ai = AI(cfg)
-        self.local = LocalAI(cfg) if cfg.get("local_ai") else None
+        if cfg.get("local_ai"):
+            # "hf" — бесплатная Qwen 9B с Hugging Face (transformers), иначе — Ollama
+            self.local = HFBackend(cfg) if cfg.get("ai_backend") == "hf" else LocalAI(cfg)
+        else:
+            self.local = None
         if self.local:
             self.local.on_model_change = self._remember_model
         self.actions = Actions(cfg, BASE, self.ai, save=save_entry)
@@ -486,6 +493,23 @@ class Capri(QObject):
         for key in ("sites", "apps", "app_aliases", "search_when_unsure", "browser", "chatter", "replies",
                     "user_name_mode", "user_name", "user_gender"):
             self.cfg[key] = fresh[key]
+        # смена бэкенда разума (ollama <-> hf) или модели на лету — без перезапуска
+        backend = fresh.get("ai_backend", "ollama")
+        if self.cfg.get("ai_backend") != backend or (backend == "hf" and
+                                                    self.cfg.get("hf_model") != fresh.get("hf_model")):
+            self.cfg["ai_backend"] = backend
+            self.cfg["hf_model"] = fresh.get("hf_model")
+            if hasattr(self.local, "shutdown"):
+                self.local.shutdown()  # снимаем старый воркер перед переключением
+            if fresh.get("local_ai"):
+                self.local = HFBackend(fresh) if backend == "hf" else LocalAI(fresh)
+                self.local.on_model_change = self._remember_model
+                self.actions.local = self.local
+                threading.Thread(target=self.local.start_server, daemon=True).start()
+                log.info("Разум переключён на %s", "Hugging Face Qwen" if backend == "hf" else "Ollama")
+            else:
+                self.local = None
+                self.actions.local = None
         self.actions.set_lists(self.cfg)
         apply_user(self.cfg)
         log.info("config.json перечитан")
