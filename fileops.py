@@ -211,17 +211,12 @@ def _on_rm_error(func, path, exc_info):
 
 
 def delete_item(path):
-    """Удалить файл в корзину, папку — рекурсивно тоже в корзину (если есть winshell), иначе навсегда."""
+    """Удалить навсегда (корзина не используется: у пользователя включена автоочистка корзины,
+    так что она ничего не гарантирует). Безопасность обеспечивает подтверждение «да» в actions."""
     if not allowed_path(path):
         raise PermissionError("системная или чужая папка")
-    try:  # пробуем корзину — самый безопасный вариант для пользователя
-        from send2trash import send2trash  # pip install send2trash
-        send2trash(path)
-        return "в корзину"
-    except Exception:
-        pass
     if os.path.isdir(path):
         shutil.rmtree(path, onerror=_on_rm_error)
     else:
         os.remove(path)
-    return "навсегда"
+    return True

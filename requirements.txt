@@ -16,6 +16,8 @@ winrt-runtime>=2.0
 winrt-Windows.Media.Control>=2.0
 winrt-Windows.Foundation>=2.0
 winrt-Windows.Foundation.Collections>=2.0
+# --- умный поиск в интернете (websearch): без него работает резервный путь через DuckDuckGo Lite ---
+ddgs>=9.0
 # --- опционально: разум с Hugging Face (Qwen 3.5 9B без Ollama) — ставит setup_hf.bat ---
 # transformers>=4.51
 # accelerate

@@ -1417,8 +1417,8 @@ class Actions:
 
         def do():
             try:
-                where = fileops.delete_item(path)
-                return Reply(line("file_deleted", t=name, where=where))
+                fileops.delete_item(path)
+                return Reply(line("file_deleted", t=name))
             except PermissionError:
                 return Reply(line("file_forbidden", t=name))
             except OSError as e:
@@ -1456,15 +1456,18 @@ class Actions:
             rows = websearch.web_search(cmd)
             if rows:
                 model = getattr(self, "local", None)
-                text = websearch.answer_with_web(
-                    cmd, model.generate if model else (lambda msgs, **kw: ""), rows=rows)
-                if not text:  # модель молчит — озвучиваем лучший сниппет как есть
+                text = None
+                if model is not None and getattr(model, "ready", True):
+                    try:  # модель жива — просим пересказать найденное в стиле Капри
+                        text = websearch.answer_with_web(
+                            cmd, lambda msgs, **kw: model.generate(msgs, max_tokens=300), rows=rows)
+                    except Exception as e:
+                        log.info("веб-ответ через модель не вышел: %s", e)
+                if not text:  # модель молчит/не подключена — озвучиваем лучший сниппет как есть
                     top = rows[0]
-                    text = f"{top['title']}. {top['snippet']}".strip(". ")
-                self.web("https://www.google.com/search?q=" + urllib.parse.quote(cmd))
+                    text = ". ".join(x for x in (top["title"], top["snippet"]) if x)
                 return Reply(line("web_answer", t=text))
-            self.web("https://www.google.com/search?q=" + urllib.parse.quote(cmd))
-            return Reply(line("search_q"))
+            return Reply(line("web_none", t=cmd))
         if wants_answer:
             return Reply(line("dont_know"))
         return Reply(line("unknown"))
@@ -1977,17 +1980,63 @@ class Actions:
                 prev = best.get(name, (0.0, []))
                 best[name] = (max(prev[0], score), prev[1] + [p])
         if not best:
+            # точного совпадения с запущенным процессом нет — думаем, какую ПРОГРАММУ он имел в виду:
+            # ищем установленные приложения по названию (гласс → Discord) и спрашиваем подтверждение
+            guess = self._guess_program(t)
+            if guess:
+                def do_close(name=guess[0], procs=guess[1]):
+                    return self._kill(name, procs, force)
+                self.pending = do_close
+                return Reply(line("confirm_close", t=guess[2]), "ask")
             return Reply(line("not_running", t=t))
         ranked = sorted(best.items(), key=lambda kv: -kv[1][0])
         top_name, (top_score, _) = ranked[0]
         close = [kv for kv in ranked[1:] if top_score - kv[1][0] < 0.1]
         if top_score < 1.0 and close:  # несколько похожих — спрашиваем, что закрыть
-            self.choice = [(n, (lambda procs=procs, n=n: self._kill(n, procs, force))) for n, (_, procs) in
+            self.choice = [(n, (lambda procs=procs, n=n: self._confirm_kill(n, procs, force))) for n, (_, procs) in
                            [ranked[0]] + close[:2]]
             ords = ["первое", "второе", "третье"]
             listed = ", ".join(f"{ords[i]} — {n}" for i, (n, _) in enumerate(self.choice))
             return Reply(line("choose_close", t=listed), "ask")
-        return self._kill(top_name, best[top_name][1], force)
+        if top_score >= 1.0 or force:  # название точное или просили принудительно — без вопросов
+            return self._kill(top_name, best[top_name][1], force)
+        # совпадение приблизительное — переспрашиваем, чтобы не закрыть лишнего
+        def do():
+            return self._kill(top_name, best[top_name][1], force)
+        self.pending = do
+        return Reply(line("confirm_close", t=top_name), "ask")
+
+    def _confirm_kill(self, name, procs, force):
+        """Пользователь уже выбрал вариант из списка похожих процессов — это и есть подтверждение."""
+        return self._kill(name, procs, force)
+
+    def _guess_program(self, t):
+        """«закрой гласс» → процессы установленного Discord: (имя_процесса, [процессы], человекочитаемое).
+
+        Ищем приложение по названию среди ярлыков/реестра, затем смотрим, запущены ли процессы,
+        чьё имя похоже на название программы. Возвращает None, если догадка не одна и та же уверенная."""
+        try:
+            self.index.ready.wait(timeout=8)
+            options = self.index.candidates(t, self.aliases, limit=3)
+        except Exception:
+            return None
+        user = psutil.Process().username()
+        for score, app_name, _target in options:
+            if score < 0.72:
+                continue
+            stems = {app_name.split()[0].lower(), norm(app_name).replace(" ", "")}
+            found = {}
+            for p in psutil.process_iter(["name", "username"]):
+                pname = (p.info["name"] or "").lower().removesuffix(".exe")
+                if not pname or pname in PROTECTED_PROCS or p.info["username"] != user:
+                    continue
+                if any(AppIndex.sounds_like(s, pname) or pname.startswith(s) or s.startswith(pname)
+                       for s in stems if len(s) >= 3):
+                    found.setdefault(pname, []).append(p)
+            if found:
+                name = max(found, key=lambda k: len(found[k]))
+                return name, found[name], app_name.title()
+        return None
 
     @staticmethod
     def _kill(name, procs, force=False):
