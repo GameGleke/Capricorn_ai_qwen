@@ -18,6 +18,7 @@ CONFIG = os.path.join(BASE, "config.json")
 REPO = "unsloth/Qwen3.5-9B-GGUF"
 # (файл GGUF, человекочитаемое описание, минимальная оперативка ГБ)
 QUANTS = [
+    ("Qwen3.5-9B-Q6_K.gguf", "самая умная, ~7.4 ГБ — для видеокарт от 10 ГБ (у тебя влезет целиком)", 16),
     ("Qwen3.5-9B-Q4_K_M.gguf", "умная, ~5.3 ГБ — нужна видеокарта от 6 ГБ или 16 ГБ памяти", 12),
     ("Qwen3.5-9B-Q3_K_M.gguf", "чуть глупее, ~4.4 ГБ — для ПК с 12 ГБ памяти", 10),
     ("Qwen3.5-4B-Q4_K_M.gguf", "лёгкая 4B, ~2.8 ГБ — ноутбуки и слабые ПК, отвечает проще", 8),
@@ -73,8 +74,8 @@ def pick_quant(vram, ram):
     """Самая умная квантизация, которая влезет: на GPU — по видеопамяти, без GPU — по RAM."""
     budget = vram - 1.5 if vram >= 6 else min(ram - 4, 10)  # запас на систему и контекст
     for fname, desc, need in QUANTS:
-        size = {"Qwen3.5-9B-Q4_K_M.gguf": 5.3, "Qwen3.5-9B-Q3_K_M.gguf": 4.4,
-                "Qwen3.5-4B-Q4_K_M.gguf": 2.8}[fname]
+        size = {"Qwen3.5-9B-Q6_K.gguf": 7.4, "Qwen3.5-9B-Q4_K_M.gguf": 5.3,
+                "Qwen3.5-9B-Q3_K_M.gguf": 4.4, "Qwen3.5-4B-Q4_K_M.gguf": 2.8}[fname]
         if size <= budget and ram >= need:
             return fname
     return QUANTS[-1][0]
@@ -94,6 +95,93 @@ def edit_config(**kv):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _pip_show(name):
+    """Версия установленного через pip пакета (или None)."""
+    try:
+        out = subprocess.run([sys.executable, "-m", "pip", "show", name],
+                             capture_output=True, text=True, timeout=30).stdout
+        for line in out.splitlines():
+            if line.startswith("Version:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+
+def _disk_free_gb(path):
+    try:
+        return shutil.disk_usage(path).free / 2**30
+    except Exception:
+        return 999.0
+
+
+def install_prebuilt():
+    """Ставим готовый CUDA-wheel llama-cpp-python со страницы релизов — компилятор не нужен."""
+    ver = "0.3.36"
+    tag = "v%s-cu125" % ver
+    api = "https://api.github.com/repos/abetlen/llama-cpp-python/releases/tags/" + tag
+    url = ""
+    try:
+        req = urllib.request.Request(api, headers={"User-Agent": "capri-setup"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.load(r)
+        for a in data.get("assets", []):
+            name = a.get("name", "")
+            if name.endswith("win_amd64.whl") and a.get("browser_download_url"):
+                url = a["browser_download_url"]
+                size = int(a.get("size", 0)) // 2**20
+                break
+    except Exception as e:
+        say("[!] Не смог список релизов GitHub: %s" % e)
+    if not url:
+        # запасной вариант — известное имя файла этого релиза
+        url = ("https://github.com/abetlen/llama-cpp-python/releases/download/"
+               "%s/llama_cpp_python-%s-py3-none-win_amd64.whl" % (tag, ver))
+    whl = os.path.join(BASE, "_llama_cuda.whl")
+    if _disk_free_gb(os.environ.get("LOCALAPPDATA", BASE)) < 4:
+        say("[!] Мало места на диске для CUDA-сборки (<4 ГБ) — пропуск, ставим CPU-вариант.")
+        return False
+    say("[Capri] Качаю готовую CUDA-сборку llama.cpp (~500 МБ, один раз)...")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "capri-setup"})
+        with urllib.request.urlopen(req, timeout=60) as r, open(whl + ".part", "wb") as out:
+            total = int(r.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = r.read(2**20)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if total:
+                    print("\r[Capri]   %3.0f%% (%.1f/%.1f МБ)" %
+                          (done * 100 / total, done / 2**20, total / 2**20), flush=True)
+        os.replace(whl + ".part", whl)
+        say("")
+    except Exception as e:
+        say("[!] Готовый wheel не скачался: %s" % e)
+        try:
+            os.remove(whl + ".part")
+        except OSError:
+            pass
+        return False
+    ok = run([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", whl])
+    try:
+        os.remove(whl)
+    except OSError:
+        pass
+    if not ok:
+        return False
+    r = subprocess.run([sys.executable, "-c",
+                        "import llama_cpp; from llama_cpp import Llama; print('[OK] импорт llama_cpp выполнен')"],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        say("[OK] Установлена CUDA-версия llama-cpp-python — модель будет считать на видеокарте.")
+        return True
+    say("[!] CUDA-wheel поставился, но не импортируется: " + (r.stderr or "").strip()[:300])
+    return False
+
+
 def install_package():
     try:
         import llama_cpp  # noqa: F401
@@ -101,16 +189,27 @@ def install_package():
         return True
     except ImportError:
         pass
-    say("[Capri] Ставлю llama-cpp-python...")
-    if run([sys.executable, "-m", "pip", "install", "-U", "huggingface_hub"]):
-        pass
-    # обычный wheel компилируется на CPU — работает везде, GPU подхватывает, если собрана CUDA-версия
+    run([sys.executable, "-m", "pip", "install", "-U", "huggingface_hub"])
+    vram = nvidia_vram_gb()
+    if vram >= 6:  # есть NVIDIA — пробуем готовый CUDA-wheel без всякой компиляции
+        if install_prebuilt():
+            return True
+        say("[Capri] Возвращаюсь к обычной установке...")
+    say("[Capri] Ставлю llama-cpp-python (CPU-сборка)...")
     if run([sys.executable, "-m", "pip", "install", "llama-cpp-python"]):
         return True
-    say("[!] Не вышло. Попробуй так (компилятор должен быть установлен):")
-    say("    python -m pip install llama-cpp-python --no-build-isolation")
-    say("    Для NVIDIA быстрее: python -m pip install llama-cpp-python --config-settings=build=\"cmake\" "
-        "--config-settings=arguments.cmake.build-type=Release (нужен Visual Studio Build Tools)")
+    # частая причина на Windows: нет компилятора (nmake/Visual Studio Build Tools)
+    say("[!] Сборка из исходников не удалась — скорее всего, на Windows нет компилятора C/C++")
+    say("    (ошибка 'nmake: no such file or directory' — это ровно оно).")
+    if vram >= 6:
+        say("    У тебя NVIDIA-видеокарта — попробуй ещё раз setup_llama.bat: он качает")
+        say("    готовый CUDA-wheel (~1.5 ГБ), компилятор для него НЕ нужен.")
+    else:
+        say("    Варианты без компилятора:")
+        say("    1) Установить Visual Studio Build Tools (галочка Desktop development with C++) и повторить:")
+        say("       https://visualstudio.microsoft.com/ru/visual-cpp-build-tools/")
+        say("    2) Временно: python tools/install_llama.py --cpu-only (если есть готовый wheel)")
+        say("    3) Вернуться на Ollama: setup_ai.bat (там всё в одном установщике, без сборки).")
     return False
 
 
@@ -155,7 +254,7 @@ def test(fname):
     code = (
         "import sys; sys.path.insert(0, r'%s');\n"
         "from llama_cpp import Llama\n"
-        "llm = Llama(model_path=r'%s', n_ctx=4096, n_gpu_layers=99, verbose=False)\n"
+        "llm = Llama(model_path=r'%s', n_ctx=4096, n_gpu_layers=-1, verbose=False)\n"
         "out = llm.create_chat_completion(messages=[{'role':'user','content':'Скажи одну короткую фразу на русском.'}], max_tokens=40)\n"
         "print('ОТВЕТ:', out['choices'][0]['message']['content'][:200])\n" % (BASE, os.path.join(BASE, "gguf_models", fname))
     )
