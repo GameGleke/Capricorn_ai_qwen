@@ -13,3 +13,8 @@ samples/
 __pycache__/
 *.pyc
 *.tmp
+
+# локальные артефакты Steam-запуска (не относятся к проекту)
+sclauncher.log
+sc_country_cache
+sc_realm_cache
