@@ -115,63 +115,75 @@ def _disk_free_gb(path):
         return 999.0
 
 
-def nvidia_cuda_major():
-    """Версия CUDA, которую поддерживает драйвер (старше или равна cu118 — вернёт None)."""
+def nvidia_cuda_version():
+    """Версия CUDA, которую поддерживает драйвер, как float (например 12.4). None если не нашли."""
     nvsmi = shutil.which("nvidia-smi")
     if not nvsmi:
         return None
     try:
         out = subprocess.run([nvsmi], capture_output=True, text=True, timeout=10).stdout
         import re as _re
-        m = _re.search(r"CUDA Version:\s*(\d+)\.", out)
+        m = _re.search(r"CUDA Version:\s*(\d+)\.(\d+)", out)
         if m:
-            return int(m.group(1))
+            return float("%s.%s" % (m.group(1), m.group(2)))
     except Exception:
         pass
     return None
 
 
-def install_prebuilt():
-    """Ставим готовый CUDA-wheel llama-cpp-python со страницы релизов — компилятор не нужен.
+def gh_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "capri-setup",
+                                               "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
 
-    Важно: в релизных win-колесах тег cuXXX означает версию сборки, а pip видит обычный
-    py3-none-win_amd64 и НЕ проверяет CUDA сам. Если у пользователя драйвер старее
-    (например CUDA 11), колесо cu125 поставится, но не импортируется. Поэтому перебираем
-    варианты от новой CUDA к старой и после каждой попытки проверяем реальный импорт.
+
+def find_prebuilt_wheel(drv):
+    """Ищем в релизах abetlen/llama-cpp-python готовое win-колесо под CUDA драйвера.
+
+    Возвращает (download_url, имя_файла, тег_сборки) или None. Идём по тегам вида
+    v<вер>-cu<XX> от новой CUDA к старой; берём только те, чья CUDA <= драйверной
+    (иначе wheel поставится, но llama.dll не загрузится — та ошибка, что была раньше).
+    Список релизов берётся с GitHub API, поэтому имена файлов и URL никогда не устареют.
     """
-    drv = nvidia_cuda_major()
-    order = ["cu132", "cu130", "cu125", "cu124", "cu123", "cu122", "cu121", "cu118"]
-    if drv is not None:  # берём только теги не новее поддержки драйвера
-        fit = [t for t in order if int(t[2:]) <= drv]
-        if not fit:
-            say("[!] Драйвер поддерживает только CUDA %s — готовые wheels llama.cpp (cu118+) не подойдут." % drv)
-            return False
-        order = fit
-    tried = set()
-    for cuda in order:
-        for ver in ("0.3.36", "0.3.35", "0.3.34"):
-            key = (ver, cuda)
-            if key in tried:
+    order = [132, 130, 125, 124, 123, 122, 121, 118]
+    if drv is not None:
+        order = [c for c in order if c <= int(drv * 10)]
+    if not order:
+        say("[!] Драйвер NVIDIA поддерживает CUDA ниже 11.8 — готовые wheels не подойдут.")
+        say("    Обнови драйвер: https://www.nvidia.com/Download/index.aspx")
+        return None
+    try:
+        releases = gh_json("https://api.github.com/repos/abetlen/llama-cpp-python/releases?per_page=100")
+    except Exception as e:
+        say("[!] Не смог получить список релизов с GitHub: %s" % e)
+        return None
+    by_tag = {r["tag_name"]: r for r in releases}
+    vers = sorted({t.split("-")[0][1:] for t in by_tag if "-cu" in t}, reverse=True)[:3]
+    for cu in order:
+        for ver in vers:
+            rel = by_tag.get("v%s-cu%s" % (ver, cu))
+            if not rel:
                 continue
-            tried.add(key)
-            tag = "v%s-%s" % (ver, cuda)
-            fname = "llama_cpp_python-%s-py3-none-win_amd64.whl" % ver
-            url = "https://github.com/abetlen/llama-cpp-python/releases/download/%s/%s" % (tag, fname)
-            ok = _try_wheel(url, tag)
-            if ok:
-                return True
-            if os.path.isfile(os.path.join(BASE, fname)):
-                try:
-                    os.remove(os.path.join(BASE, fname))
-                except OSError:
-                    pass
-    say("[!] Ни одна готовая CUDA-сборка не подошла (см. сообщения выше).")
-    return False
+            for a in rel.get("assets", []):
+                if a["name"].endswith("win_amd64.whl"):
+                    return a["browser_download_url"], a["name"], "v%s-cu%s" % (ver, cu)
+    return None
 
 
-def _try_wheel(url, tag):
-    # pip требует корректного имени файла wheel — сохраняем под именем из URL
-    fname = url.split("/")[-1].split("?")[0] or "llama_cuda.whl"
+def install_prebuilt():
+    """Ставим готовый CUDA-wheel llama-cpp-python со страницы релизов — компилятор не нужен."""
+    drv = nvidia_cuda_version()
+    found = find_prebuilt_wheel(drv)
+    if not found:
+        return False
+    url, fname, tag = found
+    return _try_wheel(url, tag, fname)
+
+
+def _try_wheel(url, tag, fname=None):
+    # pip требует корректного имени файла wheel — сохраняем под именем из релиза
+    fname = fname or url.split("/")[-1].split("?")[0] or "llama_cuda.whl"
     whl = os.path.join(BASE, fname)
     if os.path.isfile(whl) and open(whl, "rb").read(2) == b"PK":
         say("[Capri] Wheel %s уже скачен — пропускаю качание." % fname)
@@ -225,9 +237,14 @@ def _try_wheel(url, tag):
         return True
     err = (r.stderr or "").strip()
     say("[!] Сборка %s поставилась, но не запускается Python-модуль: %s" % (tag, err[:300]))
+    run([sys.executable, "-m", "pip", "uninstall", "-y", "llama-cpp-python"])
+    try:
+        os.remove(whl)
+    except OSError:
+        pass
     if "DLL" in err or "dll" in err:
         say("    Обычно это значит: версия CUDA сборки новее, чем поддерживает твой драйвер NVIDIA.")
-        say("    Пробую сборку со старой CUDA...")
+        say("    Обнови драйвер: https://www.nvidia.com/Download/index.aspx")
     return False
 
 
