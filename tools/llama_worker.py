@@ -73,6 +73,8 @@ STOP_TAIL = re.compile(r"<\|im_end\|>.*|<\|endoftext\|>.*|</think>.*", re.S)
 
 def generate(llm, messages, max_new_tokens):
     kwargs = dict(max_tokens=max_new_tokens, temperature=0.6, top_p=0.9, repeat_penalty=1.15)
+    if not any(m.get("role") == "system" for m in messages):
+        kwargs["add_generation_prompt"] = True  # голый user-запрос всё равно должен открыть блок ассистента
     try:
         out = llm.create_chat_completion(messages=messages, enable_thinking=False, **kwargs)
     except (TypeError, ValueError):  # шаблон/версия без переключателя размышлений

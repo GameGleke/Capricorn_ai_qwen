@@ -20,6 +20,8 @@ import psutil
 import automation
 import fileops
 import media
+import mouse
+import screen
 import websearch
 from persona import line
 
@@ -1075,6 +1077,14 @@ class Actions:
             (r"который час|сколько времени|сколько сейчас времени|время сейчас", self.time),
             (r"какое (сегодня )?число|какая (сегодня )?дата|какой сегодня день", self.date),
             (r"скриншот|скрин экрана|сделай скрин", self.screenshot),
+            # --- зрение: анализ экрана с отчётом в файл ---
+            (r"(что (у меня )?(сейчас )?(на экране|открыто на экране)|опиши экран|проанализируй экран|"
+             r"посмотри (на |в )?экран|разбор экрана|видишь (мой )?экран|что ты видишь)", self.screen_analyze),
+            # --- мышь: клики, перемещение курсора, drag ---
+            (r"^(кликни|клик|щелкни|щелк|двойной клик|дважды кликни|зажми (левую|правую|среднюю) кнопку|"
+             r"отпусти (кнопку|мышь)|переведи курсор|подведи курсор|поставь курсор|передвинь мышь|"
+             r"перетащи|протащи|тащи мышью)[^,]*$", self.mouse_cmd),
+            (r"(кликни|щелкни)( мне)? (правой|левой|средней)? ?кнопк", self.mouse_cmd),
         ]
 
     def handle(self, cmd):
@@ -1461,6 +1471,7 @@ class Actions:
 
         Раньше здесь открывался только Google с фразой «попросите загуглить» — теперь Капри
         сама делает запрос (websearch), читает выдачу и пересказывает ответ голосом.
+        Если разум не поднялся (self.local.error) — честно говорит причину вместо тихого поиска.
         """
         c = norm(cmd)
         wants_answer = force_search or re.match(r"^(что|кто|как|какой|какая|какое|какие|почему|зачем|сколько|где|когда|куда|"
@@ -1480,10 +1491,29 @@ class Actions:
                     top = rows[0]
                     text = ". ".join(x for x in (top["title"], top["snippet"]) if x)
                 return Reply(line("web_answer", t=text))
+            if self.ai_down_reason():
+                return Reply(line("ai_down_search", e=self.ai_down_reason()))
             return Reply(line("web_none", t=cmd))
         if wants_answer:
+            reason = self.ai_down_reason()
+            if reason:  # сеть не помогла и разум не работает — пользователь должен знать почему
+                return Reply(line("ai_down", e=reason))
             return Reply(line("dont_know"))
+        reason = self.ai_down_reason()
+        if reason:
+            return Reply(line("ai_down_cmd", e=reason))
         return Reply(line("unknown"))
+
+    def ai_down_reason(self):
+        """Почему нейросеть молчит (для честного ответа пользователю). '' — если всё ок или ИИ не включён."""
+        m = getattr(self, "local", None)
+        if m is None:
+            return ""
+        if getattr(m, "error", ""):
+            return str(m.error)[:200]
+        if not getattr(m, "ready", True):
+            return "модель не загружена"
+        return ""
 
     # --- команды ---
     def quit(self, c, m):
@@ -2212,6 +2242,23 @@ class Actions:
 
     def press(self, c, m):
         text = m.group("k")
+        # «сначала ctrl z, потом ctrl z» / «a, затем b, потом c» — последовательность комбинаций
+        parts = re.split(r",?\s*(?:сначала|потом|затем|после этого|следом|далее)\s+", text)
+        parts = [p.strip(" ,.") for p in parts if p.strip(" ,.")]
+        if len(parts) > 1:
+            done, failed = [], []
+            for p in parts:
+                keys, unknown = parse_keys(p)
+                if unknown:
+                    return Reply(line("key_unknown", t=unknown))
+                if not keys:
+                    continue
+                send_keys(keys)
+                time.sleep(0.12)
+                done.append("+".join(k.upper() if len(k) == 1 else k.capitalize() for k in keys))
+            if not done:
+                return None
+            return Reply(line("pressed_seq", t=", затем ".join(done)))
         times = 1
         rep = re.search(r"\s(\S+) раз\w*$", text)
         if rep and parse_number(rep.group(1)):
@@ -2243,6 +2290,25 @@ class Actions:
         path = os.path.join(folder, f"screen_{datetime.datetime.now():%Y%m%d_%H%M%S}.png")
         ImageGrab.grab(all_screens=True).save(path)
         return Reply(line("screenshot"))
+    def screen_analyze(self, c, m):
+        """«Посмотри на экран» — снимок + ИИ-разбор, отчёт в файл Documents\\Capri."""
+        q = screen.extract_question(c)
+        backend = getattr(self, "local", None) or getattr(self, "ai", None)
+        text, path = screen.analyze_screen(backend, q)
+        if text is None:
+            return Reply(line("screen_fail", e=path))
+        short = re.split(r"\n", text.strip())[0][:150]
+        return Reply(line("screen_report", t=short, p=path))
+
+    def mouse_cmd(self, c, m):
+        spec = mouse.parse_click(norm(c))
+        if not spec:
+            return None
+        out = mouse.do_click(spec)
+        if out is None:
+            return Reply(line("mouse_where"))
+        return Reply(out)
+
 
     def _run(self, target):
         if target.startswith(("http://", "https://")):
