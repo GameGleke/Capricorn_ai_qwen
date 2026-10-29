@@ -115,20 +115,46 @@ def _disk_free_gb(path):
         return 999.0
 
 
-def nvidia_cuda_version():
-    """Версия CUDA, которую поддерживает драйвер, как float (например 12.4). None если не нашли."""
+def nvidia_cuda_versions():
+    """Все версии CUDA, которые видит система, как список float по убыванию.
+
+    Берём и «CUDA Version» из nvidia-smi (максимум по ДРАЙВЕРУ), и реально
+    установленные тулкиты CUDA Toolkit (переменная окружения CUDA_PATH, папки
+    C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\vXX.Y, PATH). Это важно:
+    готовые wheels llama.cpp собирают с динамической привязкой к cuda.dll конкретной
+    мажорной версии — wheel cu132 требует CUDA-тулкит 13.2 на машине даже при свежем
+    драйвере. Раньше учитывался только драйвер, из-за чего ставилось колесо, чей
+    llama.dll не мог найти свою cuda.dll (ошибка 'Could not find module ... llama.dll').
+    """
+    found = set()
     nvsmi = shutil.which("nvidia-smi")
-    if not nvsmi:
-        return None
-    try:
-        out = subprocess.run([nvsmi], capture_output=True, text=True, timeout=10).stdout
-        import re as _re
-        m = _re.search(r"CUDA Version:\s*(\d+)\.(\d+)", out)
+    if nvsmi:
+        try:
+            out = subprocess.run([nvsmi], capture_output=True, text=True, timeout=10).stdout
+            import re as _re
+            for m in _re.finditer(r"CUDA Version:\s*(\d+)\.(\d+)", out):
+                found.add(float("%s.%s" % (m.group(1), m.group(2))))
+        except Exception:
+            pass
+    # реальные тулкиты: CUDA_PATH + стандартные папки + PATH
+    import glob as _glob
+    import re as _re
+    cands = []
+    cp = os.environ.get("CUDA_PATH") or os.environ.get("CUDA_PATH_V_ANY")
+    if cp:
+        cands.append(cp)
+    cands += _glob.glob(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*")
+    for p in (os.environ.get("PATH") or "").split(os.pathsep):
+        if "NVIDIA GPU Computing Toolkit" in p or _re.search(r"[\\/]cuda[\\/_]?v?\d", p, _re.I):
+            cands.append(p)
+    for c in cands:
+        m = _re.search(r"v?(\d+)\.(\d+)", c or "")
         if m:
-            return float("%s.%s" % (m.group(1), m.group(2)))
-    except Exception:
-        pass
-    return None
+            try:
+                found.add(float("%s.%s" % (m.group(1), m.group(2))))
+            except ValueError:
+                pass
+    return sorted(found, reverse=True)
 
 
 def gh_json(url):
@@ -138,47 +164,68 @@ def gh_json(url):
         return json.load(r)
 
 
-def find_prebuilt_wheel(drv):
-    """Ищем в релизах abetlen/llama-cpp-python готовое win-колесо под CUDA драйвера.
+def find_prebuilt_wheel(cudas):
+    """Ищем в релизах abetlen/llama-cpp-python готовые win-колёса под CUDA машины.
 
-    Возвращает (download_url, имя_файла, тег_сборки) или None. Идём по тегам вида
-    v<вер>-cu<XX> от новой CUDA к старой; берём только те, чья CUDA <= драйверной
-    (иначе wheel поставится, но llama.dll не загрузится — та ошибка, что была раньше).
+    Возвращает СПИСОК кандидатов [(download_url, имя_файла, тег_сборки), ...] от самой
+    новой CUDA к самой старой (не более 4 штук — качать по ~500 МБ «вслепую» дорого).
+    Учитываются ВСЕ версии CUDA, что видит система (тулкиты + драйвер): wheels llama.cpp
+    динамически привязаны к cuda.dll конкретной мажорной версии, поэтому колесо cu132
+    работает только если на машине реально есть CUDA 13.x — одного свежего драйвера мало.
     Список релизов берётся с GitHub API, поэтому имена файлов и URL никогда не устареют.
     """
-    order = [132, 130, 125, 124, 123, 122, 121, 118]
-    if drv is not None:
-        order = [c for c in order if c <= int(drv * 10)]
+    order = [132, 130, 128, 126, 125, 124, 123, 122, 121, 118]
+    allowed = {int(round(c * 10)) for c in cudas} if cudas else set(order)
+    # допускаем сборки той же мажорной версии, что любой найденный тулкит/драйвер
+    majors = {c // 10 for c in allowed}
+    order = [cu for cu in order if cu in allowed or (cu // 10) in majors and cu <= max(allowed, default=999)]
     if not order:
-        say("[!] Драйвер NVIDIA поддерживает CUDA ниже 11.8 — готовые wheels не подойдут.")
-        say("    Обнови драйвер: https://www.nvidia.com/Download/index.aspx")
-        return None
+        say("[!] Не нашёл ни одной поддерживаемой версии CUDA (нужна минимум 11.8).")
+        say("    Установи CUDA Toolkit или обнови драйвер NVIDIA: https://www.nvidia.com/Download/index.aspx")
+        return []
     try:
         releases = gh_json("https://api.github.com/repos/abetlen/llama-cpp-python/releases?per_page=100")
     except Exception as e:
         say("[!] Не смог получить список релизов с GitHub: %s" % e)
-        return None
+        return []
     by_tag = {r["tag_name"]: r for r in releases}
     vers = sorted({t.split("-")[0][1:] for t in by_tag if "-cu" in t}, reverse=True)[:3]
+    out = []
+    seen = set()
     for cu in order:
         for ver in vers:
             rel = by_tag.get("v%s-cu%s" % (ver, cu))
             if not rel:
                 continue
             for a in rel.get("assets", []):
-                if a["name"].endswith("win_amd64.whl"):
-                    return a["browser_download_url"], a["name"], "v%s-cu%s" % (ver, cu)
-    return None
+                if a["name"].endswith("win_amd64.whl") and a["name"] not in seen:
+                    seen.add(a["name"])
+                    out.append((a["browser_download_url"], a["name"], "v%s-cu%s" % (ver, cu)))
+    return out[:4]
 
 
 def install_prebuilt():
-    """Ставим готовый CUDA-wheel llama-cpp-python со страницы релизов — компилятор не нужен."""
-    drv = nvidia_cuda_version()
-    found = find_prebuilt_wheel(drv)
-    if not found:
+    """Ставим готовый CUDA-wheel llama-cpp-python со страницы релизов — компилятор не нужен.
+
+    Перебираем подходящие сборки от новой CUDA к старой; неподходящая (её llama.dll не
+    грузится из-за отсутствия нужного cuda.dll) сносится автоматически, качается следующая.
+    """
+    cudas = nvidia_cuda_versions()
+    if cudas:
+        say("[Capri] Вижу CUDA в системе: %s." % ", ".join(str(c) for c in cudas))
+    else:
+        say("[Capri] Версии CUDA не найдены — буду пробовать самые свежие готовые сборки по очереди.")
+    cands = find_prebuilt_wheel(cudas)
+    if not cands:
         return False
-    url, fname, tag = found
-    return _try_wheel(url, tag, fname)
+    for url, fname, tag in cands:
+        if _try_wheel(url, tag, fname):
+            return True
+    say("[!] Ни одна готовая CUDA-сборка не запустилась. Обычно помогает:")
+    say("    1) Обновить драйвер NVIDIA И установить CUDA Toolkit нужной версии:")
+    say("       https://developer.nvidia.com/cuda-downloads (выбери свою Windows x86_64)")
+    say("    2) Либо вернуться на Ollama: setup_ai.bat (сам скачает всё необходимое, без wheels).")
+    return False
 
 
 def _try_wheel(url, tag, fname=None):
@@ -243,8 +290,8 @@ def _try_wheel(url, tag, fname=None):
     except OSError:
         pass
     if "DLL" in err or "dll" in err:
-        say("    Обычно это значит: версия CUDA сборки новее, чем поддерживает твой драйвер NVIDIA.")
-        say("    Обнови драйвер: https://www.nvidia.com/Download/index.aspx")
+        say("    Её llama.dll не нашёл нужную cuda.dll — этой сборке нужна своя версия CUDA Toolkit.")
+        say("    Буду пробовать следующую сборку (или установи CUDA Toolkit: https://developer.nvidia.com/cuda-downloads).")
     return False
 
 
