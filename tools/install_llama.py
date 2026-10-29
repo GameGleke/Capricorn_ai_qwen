@@ -160,6 +160,11 @@ def install_prebuilt():
             ok = _try_wheel(url, tag)
             if ok:
                 return True
+            if os.path.isfile(os.path.join(BASE, fname)):
+                try:
+                    os.remove(os.path.join(BASE, fname))
+                except OSError:
+                    pass
     say("[!] Ни одна готовая CUDA-сборка не подошла (см. сообщения выше).")
     return False
 
@@ -226,13 +231,29 @@ def _try_wheel(url, tag):
     return False
 
 
-def install_package():
+def _broken_install():
+    """llama_cpp поставлен, но его llama.dll не грузится (сломанная/неподходящая сборка)."""
     try:
         import llama_cpp  # noqa: F401
-        say("[OK] llama-cpp-python уже установлена.")
-        return True
+        return False
     except ImportError:
-        pass
+        return False
+    except Exception:
+        return True
+
+
+def install_package():
+    if _broken_install():
+        say("[!] Обнаружена сломанная установка llama-cpp-python (не грузится llama.dll).")
+        say("[Capri] Удаляю её и ставлю готовую CUDA-сборку заново...")
+        run([sys.executable, "-m", "pip", "uninstall", "-y", "llama-cpp-python"])
+    else:
+        try:
+            import llama_cpp  # noqa: F401
+            say("[OK] llama-cpp-python уже установлена и работает.")
+            return True
+        except ImportError:
+            pass
     run([sys.executable, "-m", "pip", "install", "-U", "huggingface_hub"])
     vram = nvidia_vram_gb()
     if vram >= 6:  # есть NVIDIA — пробуем готовый CUDA-wheel без всякой компиляции
@@ -241,13 +262,22 @@ def install_package():
         say("[Capri] Возвращаюсь к обычной установке...")
     say("[Capri] Ставлю llama-cpp-python (CPU-сборка)...")
     if run([sys.executable, "-m", "pip", "install", "llama-cpp-python"]):
-        return True
+        try:
+            import llama_cpp  # noqa: F401
+            return True
+        except Exception as e:
+            say("[!] CPU-сборка поставилась, но не запускается: %s" % str(e)[:200])
+            say("    Удаляю её — дальше нужен готовый CUDA-wheel или Visual Studio Build Tools.")
+            run([sys.executable, "-m", "pip", "uninstall", "-y", "llama-cpp-python"])
+            return False
     # частая причина на Windows: нет компилятора (nmake/Visual Studio Build Tools)
     say("[!] Сборка из исходников не удалась — скорее всего, на Windows нет компилятора C/C++")
     say("    (ошибка 'nmake: no such file or directory' — это ровно оно).")
     if vram >= 6:
         say("    У тебя NVIDIA-видеокарта — попробуй ещё раз setup_llama.bat: он качает")
-        say("    готовый CUDA-wheel (~1.5 ГБ), компилятор для него НЕ нужен.")
+        say("    готовый CUDA-wheel (~500 МБ), компилятор для него НЕ нужен.")
+        say("    Если и он не подошёл — обнови драйвер NVIDIA (нужна поддержка CUDA 12.5+):")
+        say("    https://www.nvidia.com/Download/index.aspx")
     else:
         say("    Варианты без компилятора:")
         say("    1) Установить Visual Studio Build Tools (галочка Desktop development with C++) и повторить:")
