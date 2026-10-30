@@ -306,10 +306,73 @@ def _broken_install():
         return True
 
 
+WHEELS_CPU = [
+    # Готовые CPU-колёса llama-cpp-python с GitHub-релизов (тег без суффикса = CPU):
+    # работают БЕЗ CUDA Toolkit и БЕЗ компилятора. Проверка импортом обязательна.
+    ("https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.36/llama_cpp_python-0.3.36-py3-none-win_amd64.whl",
+     "v0.3.36 cpu"),
+    ("https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-win_amd64.whl",
+     "v0.3.35 cpu"),
+    ("https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.34/llama_cpp_python-0.3.34-py3-none-win_amd64.whl",
+     "v0.3.34 cpu"),
+]
+
+
+def _import_check(tag):
+    """Реальная проверка, что библиотека грузится; при провале — удаление пакета."""
+    try:
+        import llama_cpp  # noqa: F401
+        say(f"[OK] llama-cpp-python работает ({tag}).")
+        return True
+    except Exception as e:
+        say(f"[!] Сборка {tag} поставилась, но не грузится: {str(e)[-160:]}")
+        run([sys.executable, "-m", "pip", "uninstall", "-y", "llama-cpp-python"])
+        return False
+
+
+def _rm(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def install_cpu_prebuilt():
+    """Ставим готовые CPU-колёса (без CUDA Toolkit и без компилятора)."""
+    for url, tag in WHEELS_CPU:
+        fname = url.rsplit("/", 1)[-1]
+        local = os.path.join(BASE, fname)
+        if os.path.isfile(local) and open(local, "rb").read(2) != b"PK":
+            _rm(local)  # мусорный файл вместо wheel — качаем заново
+        if not os.path.isfile(local):
+            say(f"[Capri] Качаю готовую CPU-сборку {tag} (~8 МБ, без CUDA Toolkit)...")
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "capri-setup"})
+                with urllib.request.urlopen(req, timeout=60) as r, open(local + ".part", "wb") as out:
+                    shutil.copyfileobj(r, out, length=2**20)
+                if open(local + ".part", "rb").read(2) != b"PK":
+                    raise RuntimeError("это не wheel (вернулась HTML-страница)")
+                os.replace(local + ".part", local)
+            except Exception as e:
+                say("[!] Не скачалось: %s" % str(e)[:150])
+                _rm(local + ".part")
+                continue
+        say(f"[Capri] Ставлю {fname}...")
+        if not run([sys.executable, "-m", "pip", "install", "--force-reinstall",
+                    "--no-deps", local]):
+            _rm(local)
+            continue
+        if _import_check(tag):
+            _rm(local)
+            return True
+        _rm(local)  # битое колесо выбрасываем, чтобы pip не подставлял его снова
+    return False
+
+
 def install_package():
     if _broken_install():
         say("[!] Обнаружена сломанная установка llama-cpp-python (не грузится llama.dll).")
-        say("[Capri] Удаляю её и ставлю готовую CUDA-сборку заново...")
+        say("[Capri] Удаляю её и ставлю рабочую сборку заново...")
         run([sys.executable, "-m", "pip", "uninstall", "-y", "llama-cpp-python"])
     else:
         try:
@@ -320,34 +383,28 @@ def install_package():
             pass
     run([sys.executable, "-m", "pip", "install", "-U", "huggingface_hub"])
     vram = nvidia_vram_gb()
-    if vram >= 6:  # есть NVIDIA — пробуем готовый CUDA-wheel без всякой компиляции
+    if vram >= 6:  # есть NVIDIA — пробуем готовый CUDA-wheel (максимальная скорость)
         if install_prebuilt():
             return True
-        say("[Capri] Возвращаюсь к обычной установке...")
-    say("[Capri] Ставлю llama-cpp-python (CPU-сборка)...")
+        say("[Capri] CUDA-сборки не взлетели (нет CUDA Toolkit нужной версии?) — пробую CPU-колёса...")
+    if install_cpu_prebuilt():
+        say("    Подсказка: на твоей видеокарте ответы будут быстрее, если поставить")
+        say("    CUDA Toolkit (тогда перезапусти setup_llama.bat): https://developer.nvidia.com/cuda-downloads")
+        return True
+    say("[Capri] Последняя попытка: сборка из исходников (нужен компилятор C++)...")
     if run([sys.executable, "-m", "pip", "install", "llama-cpp-python"]):
-        try:
-            import llama_cpp  # noqa: F401
+        if _import_check("исходники"):
             return True
-        except Exception as e:
-            say("[!] CPU-сборка поставилась, но не запускается: %s" % str(e)[:200])
-            say("    Удаляю её — дальше нужен готовый CUDA-wheel или Visual Studio Build Tools.")
-            run([sys.executable, "-m", "pip", "uninstall", "-y", "llama-cpp-python"])
-            return False
-    # частая причина на Windows: нет компилятора (nmake/Visual Studio Build Tools)
-    say("[!] Сборка из исходников не удалась — скорее всего, на Windows нет компилятора C/C++")
-    say("    (ошибка 'nmake: no such file or directory' — это ровно оно).")
-    if vram >= 6:
-        say("    У тебя NVIDIA-видеокарта — попробуй ещё раз setup_llama.bat: он качает")
-        say("    готовый CUDA-wheel (~500 МБ), компилятор для него НЕ нужен.")
-        say("    Если и он не подошёл — обнови драйвер NVIDIA (нужна поддержка CUDA 12.5+):")
-        say("    https://www.nvidia.com/Download/index.aspx")
     else:
-        say("    Варианты без компилятора:")
-        say("    1) Установить Visual Studio Build Tools (галочка Desktop development with C++) и повторить:")
-        say("       https://visualstudio.microsoft.com/ru/visual-cpp-build-tools/")
-        say("    2) Временно: python tools/install_llama.py --cpu-only (если есть готовый wheel)")
-        say("    3) Вернуться на Ollama: setup_ai.bat (там всё в одном установщике, без сборки).")
+        say("[!] Сборка из исходников не удалась — на Windows нет компилятора C/C++")
+        say("    (ошибка 'nmake: no such file or directory' — это ровно оно).")
+    say("")
+    say("[!] Не удалось поставить llama-cpp-python ни одной готовой сборкой. Варианты:")
+    say("    1) Проще всего — вернуться на Ollama: setup_ai.bat (всё в одном, без wheels).")
+    say("    2) Поставить CUDA Toolkit и перезапустить setup_llama.bat:")
+    say("       https://developer.nvidia.com/cuda-downloads")
+    say("    3) Visual Studio Build Tools (галочка Desktop development with C++):")
+    say("       https://visualstudio.microsoft.com/ru/visual-cpp-build-tools/")
     return False
 
 
