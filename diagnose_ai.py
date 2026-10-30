@@ -66,7 +66,8 @@ def main():
     slug = "models--" + model_id.replace("/", "--")
     snapshots = os.path.join(cache, "hub", slug, "snapshots")
     have = os.path.isdir(snapshots) and any(
-        os.path.isfile(os.path.join(dp, "config.json")) for _, dp, _ in os.walk(snapshots))
+        os.path.isfile(os.path.join(dp, fn)) for dp, _, files in os.walk(snapshots)
+        for fn in files if fn == "config.json")
     local_dir = os.path.join(BASE, "hf_models", model_id.replace("/", "--"))
     if os.path.isfile(os.path.join(local_dir, "config.json")):
         say(f"[OK] веса лежат локально: {local_dir}")
